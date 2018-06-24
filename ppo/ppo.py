@@ -11,8 +11,8 @@ import time
 import os
 from collections import deque
 from argparse import ArgumentParser
-from utils import make_atari_env, ortho_init
-from vec_env import VecFrameStack
+from common.utils import make_atari_env, ortho_init
+from common.vec_env import VecFrameStack
 
 
 EP_INFO_BUFF = deque(maxlen=100)
@@ -167,7 +167,7 @@ class PPOAgent(object):
 
 def main():
     parser = ArgumentParser()
-    parser.add_argument('--model-directory', default='/tmp/ppo2-cnn-trash/5')
+    parser.add_argument('--model-directory', default='/tmp/ppo')
     parser.add_argument('--timesteps', default=10_000_000, type=int)
     parser.add_argument('--env-id', default='PongNoFrameskip-v4')
     parser.add_argument('--num-envs', default=8, type=int)

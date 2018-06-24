@@ -3,8 +3,8 @@ import tensorflow as tf
 import random
 import gym
 
-from atari_wrappers import NoopResetEnv, MaxAndSkipEnv, Monitor, wrap_deepmind
-from vec_env import SubprocVecEnv
+from common.atari_wrappers import NoopResetEnv, MaxAndSkipEnv, Monitor, wrap_deepmind
+from common.vec_env import SubprocVecEnv
 
 
 def make_atari_env(env_id, num_env, seed):
