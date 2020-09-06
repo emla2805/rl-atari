@@ -1,49 +1,71 @@
-from collections import namedtuple, deque
+from argparse import ArgumentParser
 
 import tensorflow as tf
 from tensorflow.keras.layers import Conv2D, Dense, Flatten
 from tensorflow.keras.layers.experimental.preprocessing import Rescaling
-from tf_agents.environments import suite_atari, tf_py_environment
-from tf_agents.replay_buffers import tf_uniform_replay_buffer
 
-Experience = namedtuple(
-    "Experience", ["observation", "action", "next_step_observation", "reward"]
-)
+from typing import Tuple, List
+
+import gym
+import numpy as np
+from gym.wrappers import AtariPreprocessing, FrameStack
+
+from utils import ReplayBuffer, RunningMean
+
+
+def make_env(env_name, seed):
+    env = gym.make(env_name)
+    env = AtariPreprocessing(env, noop_max=30, frame_skip=4, screen_size=84)
+    env = FrameStack(env, num_stack=4)
+    env.seed(seed)
+    return env
+
+
+def env_step(action: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    obs, reward, done, _ = env.step(action)
+    return (
+        np.array(obs, np.uint8),
+        np.array(reward, np.int32),
+        np.array(done, np.int32),
+    )
+
+
+@tf.function(input_signature=[tf.TensorSpec([], tf.int32)])
+def tf_env_step(action: tf.Tensor) -> List[tf.Tensor]:
+    return tf.numpy_function(
+        env_step, [action], [tf.uint8, tf.int32, tf.int32]
+    )
 
 
 if __name__ == "__main__":
-    env_name = "BreakoutNoFrameskip-v4"
-    num_iterations = 20000
-    max_episode_frames = 108000
-    replay_buffer_max_length = 100_000
-    epsilon = 0.1  # Epsilon greedy parameter
-    gamma = 0.99  # Discount factor for past rewards
-    update_target_network = 10_000
+    parser = ArgumentParser()
+    parser.add_argument("--env-name", default="BreakoutNoFrameskip-v4")
+    parser.add_argument("--log-dir", default="logs/dqn")
+    parser.add_argument("--num-iterations", default=20_000, type=int)
+    parser.add_argument("--max-episode-frames", default=10_000, type=int)
+    parser.add_argument("--batch-size", default=32, type=int)
+    parser.add_argument("--learning-rate", default=2.5e-4, type=float)
+    parser.add_argument("--replay-buffer-size", default=100_000, type=int)
+    parser.add_argument("--gamma", default=0.99, type=float)
+    parser.add_argument("--min-epsilon", default=0.1, type=float)
+    parser.add_argument("--max-epsilon", default=1.0, type=float)
+    parser.add_argument("--epsilon-greedy-frames", default=1_000_000, type=int)
+    parser.add_argument("--epsilon-random-frames", default=50_000, type=int)
+    parser.add_argument("--update-target-freq", default=10_000, type=int)
+    args = parser.parse_args()
+
+    epsilon = args.max_epsilon
+
+    env = make_env(args.env_name, seed=0)
+    num_actions = 4
+    input_shape = (84, 84, 4)
     update_after_actions = 4
-    ATARI_FRAME_SKIP = 4
-
-    # replay_buffer = deque([], maxlen=replay_buffer_max_length)
-    # def gen():
-    #     for x in list(replay_buffer):
-    #         yield x
-
-    train_env = tf_py_environment.TFPyEnvironment(
-        suite_atari.load(
-            env_name,
-            max_episode_steps=max_episode_frames / ATARI_FRAME_SKIP,
-            gym_env_wrappers=suite_atari.DEFAULT_ATARI_GYM_WRAPPERS_WITH_STACKING,
-        )
-    )
-    num_actions = (
-        train_env.action_spec().maximum - train_env.action_spec().minimum + 1
-    )
-    input_shape = train_env.observation_spec().shape
 
     def create_q_net():
         return tf.keras.Sequential(
             [
                 Rescaling(1.0 / 255, input_shape=input_shape),
-                Conv2D(32, 8, strides=4, activation="relu",),
+                Conv2D(32, 8, strides=4, activation="relu"),
                 Conv2D(64, 4, strides=2, activation="relu"),
                 Conv2D(64, 3, strides=1, activation="relu"),
                 Flatten(),
@@ -54,48 +76,20 @@ if __name__ == "__main__":
 
     model = create_q_net()
     model_target = create_q_net()
-    optimizer = tf.keras.optimizers.Adam(learning_rate=0.00025, clipnorm=1.0)
+    optimizer = tf.keras.optimizers.Adam(
+        learning_rate=args.learning_rate, clipnorm=1.0
+    )
     # Using huber loss for stability
     loss_fn = tf.keras.losses.Huber()
 
-    replay_buffer = tf_uniform_replay_buffer.TFUniformReplayBuffer(
-        data_spec=(
-            tf.TensorSpec(input_shape, tf.uint8, "observation"),
-            tf.TensorSpec([], tf.int64, "action"),
-            tf.TensorSpec(input_shape, tf.uint8, "next_step_observation"),
-            tf.TensorSpec([], tf.float32, "reward"),
-            tf.TensorSpec([], tf.bool, "done"),
-        ),
-        batch_size=train_env.batch_size,
-        max_length=replay_buffer_max_length,
+    replay_buffer = ReplayBuffer(
+        capacity=args.replay_buffer_size, batch_size=args.batch_size
     )
 
-    dataset = replay_buffer.as_dataset(
-        num_parallel_calls=3, sample_batch_size=32
-    ).prefetch(3)
-    dataset = iter(dataset)
-
-    # dataset = tf.data.Dataset.from_generator(
-    #     gen,
-    #     output_types=(tf.uint8, tf.int32, tf.uint8, tf.float32),
-    #     output_shapes=(
-    #         tf.TensorShape(input_shape),
-    #         tf.TensorShape([]),
-    #         tf.TensorShape(input_shape),
-    #         tf.TensorShape([]),
-    #     ),
-    # )
-    # dataset = dataset.shuffle(10_000).repeat()
-    # dataset = dataset.batch(32)
-    # dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
-    # dataset = iter(dataset)
-
     loss_metric = tf.keras.metrics.Mean(name="loss")
-    episode_reward_metric = tf.keras.metrics.Mean(name="episode_reward")
-    episode_length_metric = tf.keras.metrics.Mean(name="episode_length")
-
-    log_dir = "logs"
-    summary_writer = tf.summary.create_file_writer(log_dir)
+    episode_reward_metric = RunningMean(name="episode_reward", capacity=100)
+    episode_length_metric = RunningMean(name="episode_length", capacity=100)
+    summary_writer = tf.summary.create_file_writer(args.log_dir)
 
     @tf.function
     def train_step(obs, action, next_obs, rewards, done):
@@ -103,9 +97,9 @@ if __name__ == "__main__":
         # Use the target model for stability
         future_rewards = model_target(next_obs, training=False)
         # Q value = reward + discount factor * expected future reward
-        updated_q_values = rewards + gamma * tf.reduce_max(
-            future_rewards, axis=1
-        )
+        updated_q_values = tf.cast(
+            rewards, tf.float32
+        ) + args.gamma * tf.reduce_max(future_rewards, axis=1)
 
         # If final frame set the last value to -1
         done = tf.cast(done, tf.float32)
@@ -127,74 +121,85 @@ if __name__ == "__main__":
         optimizer.apply_gradients(zip(grads, model.trainable_variables))
         loss_metric(loss)
 
-    frame_count = 0
-    epsilon_random_frames = 50_000
+    frame = 0
 
-    for episode in range(10000):
-        time_step = train_env.reset()
-        episode_return = 0.0
-        episode_frames = 0
+    for episode in range(args.num_iterations):
+        obs = tf.constant(env.reset(), dtype=tf.uint8)
+        obs = tf.transpose(obs, perm=[1, 2, 0])  # Channel last
+        episode_return = 0
 
-        while not time_step.is_last():
-            frame_count += 1
-            episode_frames += 1
+        for episode_frame in range(1, args.max_episode_frames):
+            frame += 1
             if (
-                frame_count < epsilon_random_frames
+                frame < args.epsilon_random_frames
                 or tf.random.uniform([]) < epsilon
             ):
                 action = tf.random.uniform(
-                    [1], maxval=num_actions, dtype=tf.int64
+                    [], maxval=num_actions, dtype=tf.int32
                 )
             else:
-                action_probs = model(time_step.observation, training=False)
-                action = tf.argmax(action_probs, axis=1)
-            next_time_step = train_env.step(action)
-            replay_buffer.add_batch(
-                (
-                    tf.squeeze(time_step.observation),
-                    tf.squeeze(action),
-                    tf.squeeze(next_time_step.observation),
-                    tf.squeeze(next_time_step.reward),
-                    tf.squeeze(next_time_step.is_last()),
+                action_probs = model(
+                    tf.expand_dims(obs, axis=0), training=False
                 )
-                # Experience(
-                #     observation=tf.squeeze(time_step.observation),
-                #     action=tf.squeeze(action),
-                #     next_step_observation=tf.squeeze(
-                #         next_time_step.observation
-                #     ),
-                #     reward=tf.squeeze(next_time_step.reward),
-                # )
-            )
-            episode_return += next_time_step.reward
-            time_step = next_time_step
+                action = tf.squeeze(
+                    tf.argmax(action_probs, axis=1, output_type=tf.int32)
+                )
+            # Decay probability of taking random action
+            epsilon -= (
+                args.max_epsilon - args.min_epsilon
+            ) / args.epsilon_greedy_frames
+            epsilon = max(epsilon, args.min_epsilon)
 
-            if (
-                frame_count % update_after_actions == 0
-                and frame_count > 50_000
-            ):
-                obs, action_sample, next_obs, rewards_sample, done_sample = next(dataset)[0]
-                train_step(obs, action_sample, next_obs, rewards_sample, done_sample)
+            next_obs, reward, done = tf_env_step(action)
+            next_obs = tf.transpose(next_obs, perm=[1, 2, 0])  # Channel last
+            replay_buffer.add(obs, action, reward, next_obs, done)
+            episode_return += reward
+            obs = next_obs
 
-            if frame_count % update_target_network == 0:
+            if frame % update_after_actions == 0 and frame > args.batch_size:
+                (
+                    obs_sample,
+                    action_sample,
+                    rewards_sample,
+                    next_obs_sample,
+                    done_sample,
+                ) = replay_buffer.sample_batch()
+                train_step(
+                    obs_sample,
+                    action_sample,
+                    next_obs_sample,
+                    rewards_sample,
+                    done_sample,
+                )
+
+            if frame % args.update_target_freq == 0:
                 # update the the target network with new weights
                 model_target.set_weights(model.get_weights())
 
                 with summary_writer.as_default():
-                    tf.summary.scalar("loss", loss_metric.result(), step=frame_count)
-                    tf.summary.scalar("episode/reward", episode_reward_metric.result(), step=frame_count)
-                    tf.summary.scalar("episode/length", episode_length_metric.result(), step=frame_count)
+                    tf.summary.scalar("loss", loss_metric.result(), step=frame)
+                    tf.summary.scalar(
+                        "episode/reward",
+                        episode_reward_metric.result(),
+                        step=frame,
+                    )
+                    tf.summary.scalar(
+                        "episode/length",
+                        episode_length_metric.result(),
+                        step=frame,
+                    )
 
                 print(
-                    f"Frame: {frame_count},",
+                    f"Frame: {frame},",
                     f"Episode: {episode},",
                     f"Loss: {loss_metric.result():.4f},",
                     f"Ep Reward: {episode_reward_metric.result():.2f},",
                     f"Ep Length: {episode_length_metric.result():.0f}",
                 )
                 loss_metric.reset_states()
-                episode_reward_metric.reset_states()
-                episode_length_metric.reset_states()
 
-            episode_reward_metric(episode_return)
-            episode_length_metric(episode_frames)
+            if done:
+                break
+
+        episode_reward_metric(episode_return)
+        episode_length_metric(episode_frame)
